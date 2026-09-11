@@ -36,6 +36,24 @@
  * If a real DOM (native browser, or something like jsdom) is already
  * present, none of this runs and that real DOM is used untouched.
  * ========================================================================== */
+async function resolveExternalCScripts() {
+  const scripts = document.querySelectorAll('script[type="text/x-c"][src]');
+
+  for (const script of scripts) {
+    const src = script.getAttribute("src");
+    try {
+      const response = await fetch(src);
+      if (!response.ok) {
+        throw new Error("File not found");
+      }
+      script.textContent = await response.text();
+    } catch (error) {
+      throw new Error("File not found");
+    }
+  }
+}
+
+resolveExternalCScripts();
 (function bootstrapBrowCEnvironment(root) {
   if (
     typeof root.document !== "undefined" &&
@@ -3919,7 +3937,7 @@ class BrowCParser {
     "_Thread_local",
   ]);
   /* BrowC extension */
-  static BROWC_KEYWORDS = new Set(["__js__"]);
+  static BROWC_KEYWORDS = new Set(["__js__", "__js__"]);
   static STORAGE_CLASS_SPECIFIERS = new Set([
     "typedef",
     "extern",
@@ -4386,11 +4404,22 @@ class BrowCParser {
         }
 
         let type = "IDENTIFIER";
-        if (
-          BrowCParser.KEYWORDS.has(idStr) ||
-          BrowCParser.BROWC_KEYWORDS.has(idStr)
-        ) {
+        if (BrowCParser.KEYWORDS.has(idStr)) {
           type = idStr;
+        } else if (BrowCParser.BROWC_KEYWORDS.has(idStr)) {
+          /*
+           * Real bug: this used to set `type = idStr` (e.g. "__js__"), but
+           * every call site that cares about the BrowC __js__(...)/__js__(...)
+           * extension checks `token.type === "JS_KEYWORD"` - a type string
+           * that was never actually produced here. That mismatch meant
+           * __js__(...)/__js__(...) tokens fell all the way through
+           * parsePrimaryExpression's checks (they aren't INTEGER_CONSTANT,
+           * FLOAT_CONSTANT, CHARACTER_CONSTANT, STRING_LITERAL, a plain
+           * IDENTIFIER, or "("), and hit the final
+           * `throw ... "expected expression, found '<token>'"` - exactly
+           * the reported "found '__js__'" / "found '__js__'" errors.
+           */
+          type = "JS_KEYWORD";
         }
 
         tokens.push(
@@ -4515,10 +4544,24 @@ class BrowCParser {
   }
 
   node(type, props = {}) {
+    /*
+     * `type` is placed AFTER `...props` so the node's tag always wins.
+     * Several call sites pass a `type` property of their own for the
+     * *C* type they're describing (CastExpression's target type,
+     * TypeUnaryExpression's sizeof(T)/_Alignof(T) argument type) - with
+     * `...props` spread after `type`, that inner `type` field silently
+     * clobbered the tag itself (e.g. a CastExpression node's `.type`
+     * became the TypeName AST object instead of the string
+     * "CastExpression"). Every `switch (node.type)` in the compiler then
+     * fell through to its default case for such nodes -
+     * "unsupported expression '[object Object]'" - even though a
+     * "CastExpression" case existed and was reachable for every other
+     * node shape.
+     */
     return {
       id: this.nodeId++,
-      type,
       ...props,
+      type,
     };
   }
 
@@ -6623,7 +6666,12 @@ class BrowCParser {
       this.expect(")");
       const expression = this.parseCastExpression();
       return this.node("CastExpression", {
-        type,
+        /*
+         * Named `targetType`, not `type` - `type` is reserved for the
+         * node's own AST tag ("CastExpression"); see the comment in
+         * node() for what went wrong when a prop was also called `type`.
+         */
+        targetType: type,
         expression,
       });
     }
@@ -6667,7 +6715,8 @@ class BrowCParser {
         this.expect(")");
         return this.node("TypeUnaryExpression", {
           operator: token.value,
-          type,
+          /* see the note in the CastExpression branch above */
+          targetType: type,
         });
       }
       const argument = this.parseUnaryExpression();
@@ -7251,7 +7300,7 @@ if (typeof module !== "undefined" && module.exports) {
       }
       const initializer = declarator.initializer
         ? this.emitExpression(declarator.initializer)
-        : this.defaultValue(node.specifiers);
+        : this.defaultValue(node.specifiers, declarator.declarator);
       this.writer.line(`let ${this.safeIdentifier(name)} = ${initializer};`);
     }
   }
@@ -7323,6 +7372,25 @@ if (typeof module !== "undefined" && module.exports) {
       case "SwitchStatement":
         this.emitSwitch(node);
         break;
+      case "CaseStatement":
+        /*
+         * Grammatically `case expr: statement` only binds one following
+         * statement, but real switch bodies are a flat statement list
+         * with case/default acting as labels within it (that's exactly
+         * how C's switch fall-through works) - so emitting the JS label
+         * followed by that one wrapped statement, inline, reproduces the
+         * same flat structure and the same fall-through behavior. This
+         * was previously entirely unhandled ("unsupported statement
+         * 'CaseStatement'"), so no `switch` with case labels could
+         * compile at all.
+         */
+        this.writer.line(`case ${this.emitExpression(node.expression)}:`);
+        this.emitStatement(node.statement);
+        break;
+      case "DefaultStatement":
+        this.writer.line("default:");
+        this.emitStatement(node.statement);
+        break;
       case "Comment":
         if (this.options.emitComments) {
           this.writer.line(node.text);
@@ -7385,7 +7453,7 @@ if (typeof module !== "undefined" && module.exports) {
       if (declarator.initializer) {
         value = this.emitExpression(declarator.initializer);
       } else {
-        value = this.defaultValue(node.specifiers);
+        value = this.defaultValue(node.specifiers, declarator.declarator);
       }
       this.writer.line(`let ${this.safeIdentifier(name)} = ${value};`);
     }
@@ -7457,7 +7525,7 @@ if (typeof module !== "undefined" && module.exports) {
       if (!name) {
         continue;
       }
-      let value = this.defaultValue(node.specifiers);
+      let value = this.defaultValue(node.specifiers, declarator.declarator);
       if (declarator.initializer) {
         value = this.emitExpression(declarator.initializer);
       }
@@ -7468,7 +7536,24 @@ if (typeof module !== "undefined" && module.exports) {
   emitSwitch(node) {
     this.writer.line(`switch (${this.emitExpression(node.expression)}) {`);
     this.writer.indent();
-    this.emitStatement(node.body);
+    /*
+     * The switch body is a CompoundStatement, but its case/default labels
+     * must sit directly inside the JS `switch (...) { ... }` block, not
+     * nested inside a further `{ }` - delegating to emitStatement(node.
+     * body) went through emitCompound(), which always wraps its output in
+     * its own brace pair, producing `switch (x) { { case 1: ... } }`,
+     * which is a JS syntax error (case labels aren't valid directly
+     * inside a plain block). Emit the compound's inner statements
+     * directly instead, the same way a C compiler treats a switch body
+     * as one flat, label-interspersed statement list.
+     */
+    if (node.body && node.body.type === "CompoundStatement") {
+      for (const statement of node.body.body || []) {
+        this.emitStatement(statement);
+      }
+    } else {
+      this.emitStatement(node.body);
+    }
     this.writer.dedent();
     this.writer.line("}");
   }
@@ -7529,12 +7614,43 @@ if (typeof module !== "undefined" && module.exports) {
           `${node.operator} ` +
           `${this.emitExpression(node.right)})`
         );
-      case "AssignmentExpression":
+      case "AssignmentExpression": {
+        /*
+         * `*ptr = value` (and `*ptr += value`, etc.) needs to go through
+         * derefAssign() - emitting the naive `${lhs} ${op} ${rhs}` here
+         * produced the literal, invalid JS `__browc.deref(ptr) = value`
+         * (a call expression can't be an assignment target), which threw
+         * "Invalid left-hand side in assignment" before the compiled
+         * program ever ran.
+         */
+        if (
+          node.left.type === "UnaryExpression" &&
+          node.left.operator === "*"
+        ) {
+          const pointerExpr = this.emitExpression(node.left.argument);
+          const rhsExpr = this.emitExpression(node.right);
+          if (node.operator === "=") {
+            return `__browc.derefAssign(${pointerExpr}, ${rhsExpr})`;
+          }
+          /*
+           * Compound assignment through a pointer (*p += 1, *p *= 2, ...):
+           * read the current value once via deref(), apply the operator,
+           * then write the result back via derefAssign(). The binary
+           * operator is the assignment operator with the trailing "="
+           * removed (e.g. "+=" -> "+").
+           */
+          const binaryOp = node.operator.slice(0, -1);
+          return (
+            `__browc.derefAssign(${pointerExpr}, ` +
+            `(__browc.deref(${pointerExpr}) ${binaryOp} ${rhsExpr}))`
+          );
+        }
         return (
           `(${this.emitExpression(node.left)} ` +
           `${node.operator} ` +
           `${this.emitExpression(node.right)})`
         );
+      }
       case "UnaryExpression":
         return this.emitUnary(node);
       case "CallExpression":
@@ -7620,8 +7736,28 @@ if (typeof module !== "undefined" && module.exports) {
       case "~":
       case "!":
         return `(${node.operator}${argument})`;
-      case "&":
-        return `__browc.addressOf(() => ${argument})`;
+      case "&": {
+        /*
+         * addressOf(getter, setter) needs a setter too, not just a
+         * getter - without one, `int *p = &x; *p = 5;` had no way to
+         * write back to `x` (addressOf's setter defaults to null, and
+         * calling .set() on a null setter throws "cannot assign through
+         * read-only reference"). Any lvalue this compiler can also emit
+         * as a plain assignment target (a bare identifier, a struct
+         * member, or an array element) gets a real setter; anything else
+         * (e.g. &*p, or the address of a non-lvalue) stays read-only,
+         * matching the previous behavior.
+         */
+        const isAssignableTarget =
+          node.argument &&
+          (node.argument.type === "Identifier" ||
+            node.argument.type === "MemberExpression" ||
+            node.argument.type === "ArraySubscriptExpression");
+        const setter = isAssignableTarget
+          ? `, (__v) => (${argument} = __v)`
+          : "";
+        return `__browc.addressOf(() => ${argument}${setter})`;
+      }
       case "*":
         return `__browc.deref(${argument})`;
       case "sizeof":
@@ -7648,17 +7784,17 @@ if (typeof module !== "undefined" && module.exports) {
      */
     return (
       `__browc.cast(` +
-      `${this.typeDescription(node.type)}, ` +
+      `${this.typeDescription(node.targetType)}, ` +
       `${this.emitExpression(node.expression)}` +
       `)`
     );
   }
   emitTypeUnary(node) {
     if (node.operator === "sizeof") {
-      return `__browc.sizeofType(${this.typeDescription(node.type)})`;
+      return `__browc.sizeofType(${this.typeDescription(node.targetType)})`;
     }
     if (node.operator === "_Alignof") {
-      return `__browc.alignof(${this.typeDescription(node.type)})`;
+      return `__browc.alignof(${this.typeDescription(node.targetType)})`;
     }
     throw new BrowCCompileError(
       `unsupported type unary operator '${node.operator}'`,
@@ -7709,8 +7845,66 @@ if (typeof module !== "undefined" && module.exports) {
       kind: "unknown",
     });
   }
-  defaultValue(specifiers = []) {
-    const names = specifiers.map((x) => x.value).filter(Boolean);
+  /*
+   * Same recursive-wrapper shape as findFunctionDeclarator, but looking for
+   * an ArrayDeclarator instead - used so `defaultValue()` can tell that
+   * `int arr[5];` needs a real 5-element array, not the scalar default "0"
+   * (previously `arr` initialized to `undefined`/`0`, so `arr[i] = ...`
+   * failed at runtime with "Cannot set properties of undefined").
+   */
+  findArrayDeclarator(node) {
+    if (!node) {
+      return null;
+    }
+    if (node.type === "ArrayDeclarator") {
+      return node;
+    }
+    if (node.direct) {
+      return this.findArrayDeclarator(node.direct);
+    }
+    if (node.declarator) {
+      return this.findArrayDeclarator(node.declarator);
+    }
+    return null;
+  }
+  isStructOrUnionType(specifiers = []) {
+    /*
+     * Deliberately narrow: only a direct `struct`/`union` specifier is
+     * recognized here. A typedef'd struct (`typedef struct {...} Point;
+     * Point p;`) can't be resolved to "this is a struct" without a real
+     * type table keyed by typedef name, which this compiler doesn't
+     * maintain - such declarations still default to "undefined" rather
+     * than risk defaulting an unrelated typedef'd scalar (e.g. `size_t`)
+     * to an object.
+     */
+    return specifiers.some((s) => s.type === "StructOrUnionSpecifier");
+  }
+  defaultValue(specifiers = [], declarator = null) {
+    /*
+     * Array declarators take priority over the base-type default: an
+     * array's runtime value must be a real JS array of the right length,
+     * not whatever scalar/struct default its element type would use on
+     * its own.
+     */
+    const arrayDeclarator = declarator
+      ? this.findArrayDeclarator(declarator)
+      : null;
+    if (arrayDeclarator) {
+      const elementDefault = this.defaultValue(
+        specifiers,
+        arrayDeclarator.declarator
+      );
+      if (arrayDeclarator.size) {
+        const sizeExpr = this.emitExpression(arrayDeclarator.size);
+        return `Array.from({ length: (${sizeExpr}) }, () => (${elementDefault}))`;
+      }
+      /*
+       * Incomplete array type (`int arr[];`) or a VLA whose size we can't
+       * pre-materialize here - fall back to an empty, growable array.
+       */
+      return `[]`;
+    }
+    const names = specifiers.map((x) => x.value || x.name).filter(Boolean);
     if (names.includes("void")) {
       return "undefined";
     }
@@ -7727,6 +7921,22 @@ if (typeof module !== "undefined" && module.exports) {
       names.includes("_Bool")
     ) {
       return "0";
+    }
+    /*
+     * `struct Point p;` (or a typedef'd struct/union) needs a real object
+     * so that later `p.x = ...` assignments have something to assign
+     * onto - it previously defaulted to the string "undefined", so every
+     * struct-typed local/global crashed on first field access with
+     * "Cannot set properties of undefined".
+     *
+     * C99 does not zero-initialize automatic aggregates without an
+     * explicit initializer (their members are indeterminate); this uses
+     * an empty object rather than attempting to model that indeterminate
+     * state, which is a deliberate simplification, not a claim of exact
+     * C semantics.
+     */
+    if (this.isStructOrUnionType(specifiers)) {
+      return "{}";
     }
     return "undefined";
   }
@@ -7968,6 +8178,7 @@ if (typeof module !== "undefined" && module.exports) {
 /* 
   Hiding <browc-file> elements from the DOM so they don't clutter the page.
 */
+
 let BROWC_FILE = document.querySelectorAll("browc-file");
 BROWC_FILE.forEach((file) => {
   file.style.display = "none";
@@ -9233,6 +9444,26 @@ class BrowCRuntimeClass {
       return pointer.get();
     }
     return this.memory.requirePointer(pointer).readUint8();
+  }
+  /*
+   * Write-side counterpart to deref(), used by the compiler for `*p = v`
+   * (and `*p += v`, etc., which reads via deref() and writes back via
+   * this). Previously `*p = v` was compiled as the literal, invalid JS
+   * `__browc.deref(p) = v` - a call expression can't be an assignment
+   * target, so this always threw "Invalid left-hand side in assignment"
+   * before the program ever got a chance to run.
+   */
+  derefAssign(pointer, value) {
+    if (
+      pointer &&
+      pointer.__browc_pointer === true &&
+      typeof pointer.set === "function"
+    ) {
+      pointer.set(value);
+      return value;
+    }
+    this.memory.requirePointer(pointer).writeUint8(value);
+    return value;
   }
   pointerAdd(pointer, amount) {
     if (!browcIsPointer(pointer)) {
@@ -15549,4 +15780,1703 @@ if (
  * `this.nextToken()` on BrowCPPTokenizer, which crashed the preprocessor
  * on the very first builtin macro it tried to tokenize. Those overrides
  * have been removed; the original class-body implementations are used.
- */
+ */ /* ============================================================
+ * BrowC C99 semantic execution layer (patched)
+ *
+ * This layer intentionally executes the parsed C AST instead of translating
+ * C operators directly to JavaScript operators.  It supplies the missing
+ * semantic boundary: C types, lvalues, object storage, pointer arithmetic,
+ * aggregate layout, conversions, control-flow signals, static locals, and
+ * C-style main/exit behavior.
+ *
+ * It is installed below the legacy JS backend so existing public APIs remain
+ * available.  The interpreter is the default program runner.
+ * ============================================================ */
+(function installBrowCC99SemanticLayer(global) {
+  "use strict";
+
+  if (!global || typeof global.parseBrowC !== "function") return;
+
+  const rt = global.BrowCRuntime;
+
+  const C = {
+    void: { kind: "scalar", name: "void", size: 0, align: 1 },
+    _Bool: { kind: "scalar", name: "_Bool", size: 1, align: 1 },
+    char: { kind: "scalar", name: "char", size: 1, align: 1, signed: true },
+    signed_char: {
+      kind: "scalar",
+      name: "signed char",
+      size: 1,
+      align: 1,
+      signed: true,
+    },
+    unsigned_char: {
+      kind: "scalar",
+      name: "unsigned char",
+      size: 1,
+      align: 1,
+      signed: false,
+    },
+    short: { kind: "scalar", name: "short", size: 2, align: 2, signed: true },
+    unsigned_short: {
+      kind: "scalar",
+      name: "unsigned short",
+      size: 2,
+      align: 2,
+      signed: false,
+    },
+    int: { kind: "scalar", name: "int", size: 4, align: 4, signed: true },
+    unsigned_int: {
+      kind: "scalar",
+      name: "unsigned int",
+      size: 4,
+      align: 4,
+      signed: false,
+    },
+    long: { kind: "scalar", name: "long", size: 8, align: 8, signed: true },
+    unsigned_long: {
+      kind: "scalar",
+      name: "unsigned long",
+      size: 8,
+      align: 8,
+      signed: false,
+    },
+    long_long: {
+      kind: "scalar",
+      name: "long long",
+      size: 8,
+      align: 8,
+      signed: true,
+    },
+    unsigned_long_long: {
+      kind: "scalar",
+      name: "unsigned long long",
+      size: 8,
+      align: 8,
+      signed: false,
+    },
+    float: { kind: "scalar", name: "float", size: 4, align: 4, float: true },
+    double: { kind: "scalar", name: "double", size: 8, align: 8, float: true },
+    long_double: {
+      kind: "scalar",
+      name: "long double",
+      size: 8,
+      align: 8,
+      float: true,
+    },
+    pointerSize: 4,
+  };
+
+  const cloneType = (t) => (t ? { ...t } : C.int);
+  const alignUp = (n, a) => Math.ceil(n / Math.max(1, a)) * Math.max(1, a);
+  const isPtr = (t) => t && t.kind === "pointer";
+  const isArray = (t) => t && t.kind === "array";
+  const isAgg = (t) => t && (t.kind === "struct" || t.kind === "union");
+  const isInt = (t) =>
+    t && t.kind === "scalar" && !t.float && t.name !== "void";
+  const isFloat = (t) => t && t.kind === "scalar" && !!t.float;
+
+  class CCell {
+    constructor(type, value, meta = {}) {
+      this.type = type;
+      this.value = value;
+      this.meta = meta;
+      this.const = !!meta.const;
+    }
+  }
+  class CEnv {
+    constructor(parent = null) {
+      this.parent = parent;
+      this.map = new Map();
+    }
+    define(name, cell) {
+      this.map.set(name, cell);
+      return cell;
+    }
+    hasLocal(name) {
+      return this.map.has(name);
+    }
+    lookup(name) {
+      if (this.map.has(name)) return this.map.get(name);
+      if (this.parent) return this.parent.lookup(name);
+      return null;
+    }
+  }
+  class CRefPointer {
+    constructor(target, stride = 1, index = 0, pointee = null) {
+      this.__browc_pointer = true;
+      this.target = target;
+      this.stride = stride;
+      this.index = index;
+      this.pointee = pointee;
+    }
+    get valid() {
+      return !!this.target;
+    }
+    get address() {
+      if (!this.target) return 0;
+      if (this.target.addressBase != null)
+        return this.target.addressBase + this.index * this.stride;
+      if (!this.target._ptrId) this.target._ptrId = CRefPointer.nextId++;
+      return this.target._ptrId * 0x100 + this.index * this.stride;
+    }
+    clone() {
+      return new CRefPointer(
+        this.target,
+        this.stride,
+        this.index,
+        this.pointee
+      );
+    }
+    add(n) {
+      return new CRefPointer(
+        this.target,
+        this.stride,
+        this.index + toSafeInt(n),
+        this.pointee
+      );
+    }
+    subtract(n) {
+      return this.add(-toSafeInt(n));
+    }
+    difference(o) {
+      if (!(o instanceof CRefPointer) || o.target !== this.target)
+        throw new Error(
+          "pointer subtraction requires pointers to the same array object"
+        );
+      return this.index - o.index;
+    }
+    get() {
+      if (!this.target) throw new Error("null pointer dereference");
+      return this.targetAt().value;
+    }
+    set(v) {
+      const c = this.targetAt();
+      if (c.const) throw new Error("assignment of read-only object");
+      c.value = convert(v, c.type);
+      return c.value;
+    }
+    targetAt() {
+      if (this.target.kind === "cell") {
+        if (this.index !== 0)
+          throw new Error("pointer arithmetic outside scalar object");
+        return this.target.cell;
+      }
+      if (this.target.kind === "array") {
+        if (this.index < 0 || this.index >= this.target.cells.length)
+          throw new Error("array pointer out of bounds");
+        return this.target.cells[this.index];
+      }
+      if (this.target.kind === "members") {
+        if (this.index !== 0)
+          throw new Error("invalid member pointer arithmetic");
+        return this.target.cell;
+      }
+      throw new Error("invalid pointer target");
+    }
+  }
+  CRefPointer.nextId = 1;
+
+  function toSafeInt(x) {
+    if (typeof x === "bigint") return Number(x);
+    const n = Number(x);
+    if (!Number.isFinite(n)) throw new Error("integer conversion overflow");
+    return Math.trunc(n);
+  }
+  function typeKey(t) {
+    if (!t) return "?";
+    if (t.kind === "pointer") return "*" + typeKey(t.to);
+    if (t.kind === "array") return "[" + t.length + "]" + typeKey(t.of);
+    if (isAgg(t)) return t.kind + ":" + (t.tag || "");
+    return t.name || t.kind;
+  }
+  function integerRange(t) {
+    const bits = t.size * 8;
+    if (!t.signed) return { min: 0n, max: (1n << BigInt(bits)) - 1n };
+    const m = 1n << BigInt(bits - 1);
+    return { min: -m, max: m - 1n };
+  }
+  function convert(v, t) {
+    if (!t) return v;
+    if (isPtr(t)) {
+      if (v == null || v === 0 || v === false) return null;
+      if (t.to?.kind === "function" && v?.__cfunction) return v;
+      if (v && v.__browc_pointer) {
+        if (v instanceof CRefPointer)
+          return new CRefPointer(v.target, v.stride, v.index, t.to);
+        if (v.clone) {
+          const p = v.clone();
+          p.pointee = t.to;
+          return p;
+        }
+        v.pointee = t.to;
+        return v;
+      }
+      throw new Error("cannot convert value to pointer");
+    }
+    if (t.kind === "array" || isAgg(t)) return v;
+    if (t.name === "_Bool") return truth(v) ? 1 : 0;
+    if (isFloat(t))
+      return t.name === "float" ? Math.fround(Number(v)) : Number(v);
+    if (isInt(t)) {
+      let n = typeof v === "bigint" ? v : BigInt(Math.trunc(Number(v) || 0));
+      const r = integerRange(t);
+      const mod = 1n << BigInt(t.size * 8);
+      n = ((n % mod) + mod) % mod;
+      if (t.signed && n > r.max) n -= mod;
+      return t.size >= 8 ? n : Number(n);
+    }
+    return v;
+  }
+  function truth(v) {
+    if (v && v.__browc_pointer) return !!v.valid;
+    return Number(v) !== 0 || (typeof v === "bigint" && v !== 0n);
+  }
+  function promote(t) {
+    if (!isInt(t)) return t;
+    if (t.size < 4) return t.signed ? C.int : C.unsigned_int;
+    return t;
+  }
+  function commonInt(a, b) {
+    a = promote(a);
+    b = promote(b);
+    if (a.float || b.float) return C.double;
+    if (a.size !== b.size) return a.size > b.size ? a : b;
+    if (a.signed === b.signed) return a;
+    return a.signed ? b : a;
+  }
+  function binaryType(a, b, op) {
+    if (
+      op === "&&" ||
+      op === "||" ||
+      op === "==" ||
+      op === "!=" ||
+      op === "<" ||
+      op === ">" ||
+      op === "<=" ||
+      op === ">="
+    )
+      return C.int;
+    if (isPtr(a) || isPtr(b)) return a;
+    if (isFloat(a) || isFloat(b)) return C.double;
+    return commonInt(a, b);
+  }
+
+  function baseType(specs, interp) {
+    const vals = (specs || []).map((s) => s.name || s.value || s.type || "");
+    const joined = vals.join(" ");
+    if (vals.some((x) => x === "_Bool")) return C._Bool;
+    if (vals.some((x) => x === "_Complex"))
+      return { kind: "complex", base: C.double, size: 16, align: 8 };
+    if (vals.some((x) => x === "_Imaginary"))
+      return { kind: "imaginary", base: C.double, size: 8, align: 8 };
+    if (vals.includes("void")) return C.void;
+    if (vals.includes("char"))
+      return vals.includes("unsigned")
+        ? C.unsigned_char
+        : vals.includes("signed")
+        ? C.signed_char
+        : C.char;
+    if (vals.includes("short"))
+      return vals.includes("unsigned") ? C.unsigned_short : C.short;
+    if (vals.includes("long") && vals.filter((x) => x === "long").length >= 2)
+      return vals.includes("unsigned") ? C.unsigned_long_long : C.long_long;
+    if (vals.includes("long"))
+      return vals.includes("unsigned") ? C.unsigned_long : C.long;
+    if (
+      vals.includes("int") ||
+      vals.includes("signed") ||
+      vals.includes("unsigned")
+    )
+      return vals.includes("unsigned") ? C.unsigned_int : C.int;
+    if (vals.includes("float")) return C.float;
+    if (vals.includes("double"))
+      return vals.includes("long") ? C.long_double : C.double;
+    const td = vals.find((v) => interp && interp.typedefs.has(v));
+    if (td) return interp.typedefs.get(td);
+    const ag = (specs || []).find((s) => s.type === "StructOrUnionSpecifier");
+    if (ag) return interp.structType(ag);
+    const en = (specs || []).find((s) => s.type === "EnumSpecifier");
+    if (en) return C.int;
+    return C.int;
+  }
+  function applyDeclarator(type, d, interp) {
+    if (!d) return type;
+    const ptrs = [];
+    if (d.pointer) {
+      let p = d.pointer;
+      while (p) {
+        ptrs.push(p);
+        p = p.next;
+      }
+    }
+    let inner = type;
+    const direct = d.direct || d;
+    let derived;
+    if (direct && direct.type === "ArrayDeclarator") {
+      const len = direct.size ? toSafeInt(interp.evalConst(direct.size)) : null;
+      derived = { kind: "array", of: null, length: len, cells: [] };
+      derived.of = applyDeclarator(inner, direct.declarator, interp);
+      inner = derived;
+    } else if (direct && direct.type === "FunctionDeclarator") {
+      derived = {
+        kind: "function",
+        returnType: inner,
+        parameters: direct.parameters || [],
+        variadic: !!direct.variadic,
+      };
+      inner = derived;
+      if (direct.declarator)
+        inner = applyDeclarator(inner, direct.declarator, interp);
+    } else if (
+      direct &&
+      direct.declarator &&
+      direct.type !== "IdentifierDeclarator"
+    ) {
+      inner = applyDeclarator(inner, direct.declarator, interp);
+    }
+    for (let i = ptrs.length - 1; i >= 0; i--)
+      inner = {
+        kind: "pointer",
+        to: inner,
+        size: C.pointerSize,
+        align: C.pointerSize,
+        qualifiers: ptrs[i].qualifiers || [],
+      };
+    return inner;
+  }
+
+  class BrowCC99Interpreter {
+    constructor(ast, options = {}) {
+      this.ast = ast;
+      this.options = options;
+      this.global = new CEnv();
+      this.structs = new Map();
+      this.unions = new Map();
+      this.typedefs = new Map();
+      this.enums = new Map();
+      this.functions = new Map();
+      this.staticCells = new Map();
+      this.labels = new Map();
+      this.collect();
+    }
+    declaratorName(d) {
+      if (!d) return null;
+      if (d.name) return d.name;
+      if (d.type === "IdentifierDeclarator") return d.name;
+      if (d.direct) return this.declaratorName(d.direct);
+      if (d.declarator) return this.declaratorName(d.declarator);
+      return null;
+    }
+    structType(s) {
+      const map = s.kind === "union" ? this.unions : this.structs;
+      const tag = s.tag || "";
+      if (map.has(tag) && !s.fields) return map.get(tag);
+      const t = { kind: s.kind, tag, size: 0, align: 1, fields: new Map() };
+      map.set(tag, t);
+      let off = 0,
+        max = 0;
+      for (const f of s.fields || []) {
+        const ft = baseType(f.specifiers, this);
+        for (const fd of f.declarators || []) {
+          let dt = applyDeclarator(ft, fd.declarator, this);
+          const name = this.declaratorName(fd.declarator);
+          if (!name) continue;
+          const a = this.alignof(dt);
+          if (s.kind === "union") off = 0;
+          else off = alignUp(off, a);
+          const field = { name, type: dt, offset: off };
+          t.fields.set(name, field);
+          if (s.kind === "union") max = Math.max(max, this.sizeofType(dt));
+          else off += this.sizeofType(dt);
+          if (s.kind === "union") max = Math.max(max, this.sizeofType(dt));
+        }
+      }
+      t.size = alignUp(s.kind === "union" ? max : off, t.align);
+      for (const f of t.fields.values())
+        t.align = Math.max(t.align, this.alignof(f.type));
+      t.size = alignUp(s.kind === "union" ? max : off, t.align);
+      return t;
+    }
+    collect() {
+      for (const d of this.ast.declarations || []) {
+        if (d.type === "FunctionDefinition") {
+          const n = this.declaratorName(d.declarator);
+          if (n) this.functions.set(n, d);
+        } else if (d.type === "Declaration") {
+          const typedef = d.specifiers?.some(
+            (s) => s.type === "StorageClassSpecifier" && s.value === "typedef"
+          );
+          for (const x of d.declarators || []) {
+            const n = this.declaratorName(x.declarator);
+            if (!n) continue;
+            const t = applyDeclarator(
+              baseType(d.specifiers, this),
+              x.declarator,
+              this
+            );
+            if (typedef) this.typedefs.set(n, t);
+          }
+          for (const s of d.specifiers || [])
+            if (s.type === "StructOrUnionSpecifier") this.structType(s);
+          for (const s of d.specifiers || [])
+            if (s.type === "EnumSpecifier") {
+              let next = 0;
+              for (const e of s.enumerators || []) {
+                const v = e.value ? this.evalConst(e.value) : next;
+                this.enums.set(e.name, v);
+                next = Number(v) + 1;
+              }
+            }
+        }
+      }
+      for (const d of this.ast.declarations || [])
+        if (d.type === "Declaration") this.declareGlobal(d);
+    }
+    sizeofType(t) {
+      if (!t) return 0;
+      if (t.kind === "pointer") return C.pointerSize;
+      if (t.kind === "array")
+        return t.length == null ? 0 : this.sizeofType(t.of) * t.length;
+      if (t.kind === "function") return 0;
+      if (t.kind === "struct" || t.kind === "union") return t.size;
+      if (t.kind === "complex") return 16;
+      return t.size || 4;
+    }
+    alignof(t) {
+      if (!t) return 1;
+      if (t.kind === "array") return this.alignof(t.of);
+      return t.align || Math.min(this.sizeofType(t) || 1, 8);
+    }
+    defaultValue(t, staticStorage = false) {
+      if (t.kind === "array") {
+        const n = t.length == null ? 0 : t.length;
+        const cells = [];
+        for (let i = 0; i < n; i++)
+          cells.push(new CCell(t.of, this.defaultValue(t.of, staticStorage)));
+        return cells;
+      }
+      if (t.kind === "struct" || t.kind === "union") {
+        const o = {};
+        for (const [n, f] of t.fields)
+          o[n] = new CCell(f.type, this.defaultValue(f.type, staticStorage));
+        return o;
+      }
+      if (t.kind === "pointer") return null;
+      if (t.name === "void") return undefined;
+      if (t.name === "float" || t.name === "double" || t.name === "long double")
+        return 0;
+      if (t.name === "_Bool" || isInt(t)) return 0;
+      if (t.kind === "complex") return { re: 0, im: 0 };
+      return 0;
+    }
+    allocateObject(t, initial, meta = {}) {
+      const cell = new CCell(
+        t,
+        initial === undefined
+          ? this.defaultValue(t, !!meta.static)
+          : convert(initial, t),
+        meta
+      );
+      return cell;
+    }
+    declareGlobal(d) {
+      const typedef = d.specifiers?.some(
+        (s) => s.type === "StorageClassSpecifier" && s.value === "typedef"
+      );
+      if (typedef) return;
+      for (const x of d.declarators || []) {
+        const n = this.declaratorName(x.declarator);
+        if (!n) continue;
+        const t = applyDeclarator(
+          baseType(d.specifiers, this),
+          x.declarator,
+          this
+        );
+        if (t.kind === "function") {
+          continue;
+        }
+        const staticStorage = d.specifiers?.some(
+          (s) =>
+            s.type === "StorageClassSpecifier" &&
+            (s.value === "static" || s.value === "extern")
+        );
+        if (
+          d.specifiers?.some(
+            (s) => s.type === "StorageClassSpecifier" && s.value === "extern"
+          ) &&
+          !x.initializer &&
+          !this.global.hasLocal(n)
+        )
+          continue;
+        const cell = this.allocateObject(t, undefined, {
+          static: staticStorage || true,
+        });
+        if (x.initializer) this.initialize(cell, x.initializer);
+        this.global.define(n, cell);
+      }
+    }
+    initialize(cell, init, env = this.global) {
+      if (!init) return;
+      if (init.type === "InitializerList") {
+        this.initList(cell, init, env);
+        return;
+      }
+      cell.value = convert(this.eval(init, env), cell.type);
+    }
+    initList(cell, list, env = this.global) {
+      if (cell.type.kind === "array") {
+        let i = 0;
+        for (const item of list.items || []) {
+          let idx = i;
+          for (const d of item.designators || [])
+            if (d.type === "IndexDesignator")
+              idx = toSafeInt(this.evalConst(d.expression || d.index));
+          if (idx >= 0 && idx < cell.value.length) {
+            this.initialize(cell.value[idx], item.initializer, env);
+          }
+          i = idx + 1;
+        }
+        return;
+      }
+      if (cell.type.kind === "struct" || cell.type.kind === "union") {
+        let names = [...cell.type.fields.keys()],
+          i = 0;
+        for (const item of list.items || []) {
+          let name = names[i];
+          for (const d of item.designators || [])
+            if (d.type === "FieldDesignator") name = d.name || d.field;
+          if (name && cell.value[name])
+            this.initialize(cell.value[name], item.initializer, env);
+          i = Math.max(i, names.indexOf(name) + 1);
+        }
+      }
+    }
+    evalConst(n) {
+      const v = this.value(n);
+      return v;
+    }
+    value(n) {
+      const r = this.eval(n, this.global);
+      return r && r.__cell ? r.value : r;
+    }
+    lvalue(n, env) {
+      if (n.type === "Identifier") {
+        const c = env.lookup(n.name);
+        if (!c) throw new Error(`undeclared identifier '${n.name}'`);
+        return c;
+      }
+      if (n.type === "ParenthesizedExpression")
+        return this.lvalue(n.expression, env);
+      if (n.type === "UnaryExpression" && n.operator === "*") {
+        const p = this.value(n.argument, env);
+        return this.derefCell(p);
+      }
+      if (n.type === "MemberExpression") {
+        let oc = this.lvalue(n.object, env);
+        if (n.throughPointer) {
+          const p = this.eval(n.object, env);
+          oc = this.derefCell(p);
+        }
+        const ot = oc.type;
+        const f = ot?.fields?.get(n.member);
+        if (!f) throw new Error(`no member '${n.member}'`);
+        return oc.value[n.member];
+      }
+      if (n.type === "ArraySubscriptExpression") {
+        const idx = toSafeInt(this.eval(n.index, env));
+        const oc = this.lvalue(n.object, env);
+        if (oc.type?.kind === "array") return oc.value[idx];
+        const base = this.eval(n.object, env);
+        if (base && base.__browc_pointer) return this.derefCell(base.add(idx));
+        throw new Error("subscripted value is not an array or pointer");
+      }
+      throw new Error(`expression is not an lvalue: ${n.type}`);
+    }
+    makePointer(cell, type, container = null, index = 0) {
+      if (container)
+        return new CRefPointer(container, this.sizeofType(type), index, type);
+      return new CRefPointer(
+        { kind: "cell", cell },
+        this.sizeofType(type),
+        0,
+        type
+      );
+    }
+    derefCell(p) {
+      if (!p || !p.__browc_pointer)
+        throw new Error("invalid/null pointer dereference");
+      if (p instanceof CRefPointer) return p.targetAt();
+      if (p.get && p.set)
+        return new CCell(p.pointee || C.char, p.get(), { externalPointer: p });
+      return this.runtimePointerCell(p);
+    }
+    runtimePointerCell(p) {
+      const t = p.pointee || C.char;
+      const value = this.loadPointer(p, t);
+      return new CCell(t, value, { externalPointer: p });
+    }
+    loadPointer(p, t) {
+      if (!global.BrowCRuntime) return 0;
+      const m = global.BrowCRuntime;
+      if (t.kind === "pointer") {
+        const a = m.load32(p);
+        const q = m.memory.pointerFromAddress(a);
+        if (q) q.pointee = t.to;
+        return q;
+      }
+      if (t.name === "char" || t.name === "signed char") return m.load8(p);
+      if (t.name === "unsigned char") return m.loadU8(p);
+      if (t.name === "short") return m.load16(p);
+      if (t.name === "unsigned short") return m.loadU16(p);
+      if (t.name === "int") return m.load32(p);
+      if (t.name === "unsigned int") return m.loadU32(p);
+      if (t.name === "float") return m.loadFloat(p);
+      if (t.name === "double") return m.loadDouble(p);
+      return p.readUint8 ? p.readUint8() : 0;
+    }
+    storePointer(p, t, v) {
+      const m = global.BrowCRuntime;
+      if (t.kind === "pointer") return m.store32(p, v?.address || 0);
+      if (t.name === "char" || t.name === "signed char") return m.store8(p, v);
+      if (t.name === "unsigned char") return m.storeU8(p, v);
+      if (t.name === "short") return m.store16(p, v);
+      if (t.name === "unsigned short") return m.storeU16(p, v);
+      if (t.name === "int") return m.store32(p, v);
+      if (t.name === "unsigned int") return m.storeU32(p, v);
+      if (t.name === "float") return m.storeFloat(p, v);
+      if (t.name === "double") return m.storeDouble(p, v);
+      return p.writeUint8(v);
+    }
+    value(n, env) {
+      return this.eval(n, env);
+    }
+    eval(n, env) {
+      if (!n) return undefined;
+      switch (n.type) {
+        case "NumericLiteral":
+          return parseCNumber(String(n.value));
+        case "CharacterLiteral":
+          return decodeCChar(n.value);
+        case "StringLiteral": {
+          const s = (n.parts || []).map((x) => decodeCString(x)).join("");
+          const bytes = new TextEncoder().encode(s + "\0");
+          const p = global.BrowCRuntime.memory
+            .allocate(bytes.length, { stringLiteral: true })
+            .pointer(0, C.char);
+          p.block.bytes.set(bytes);
+          return p;
+        }
+        case "Identifier": {
+          const c = env.lookup(n.name);
+          if (c) {
+            if (c.type?.kind === "array")
+              return new CRefPointer(
+                { kind: "array", cells: c.value },
+                this.sizeofType(c.type.of),
+                0,
+                c.type.of
+              );
+            return c.value;
+          }
+          if (this.enums.has(n.name)) return this.enums.get(n.name);
+          if (this.functions.has(n.name)) return this.functionValue(n.name);
+          const g = global[n.name];
+          if (g !== undefined) return g;
+          const native = typeof impl !== "undefined" && impl[n.name];
+          if (typeof native === "function") return native;
+          throw new Error(`undeclared identifier '${n.name}'`);
+        }
+        case "ParenthesizedExpression":
+          return this.eval(n.expression, env);
+        case "UnaryExpression":
+          return this.evalUnary(n, env);
+        case "BinaryExpression":
+          return this.evalBinary(n, env);
+        case "AssignmentExpression":
+          return this.evalAssignment(n, env);
+        case "ConditionalExpression":
+          return truth(this.eval(n.condition, env))
+            ? this.eval(n.thenExpression, env)
+            : this.eval(n.elseExpression, env);
+        case "CommaExpression": {
+          let v;
+          for (const e of n.expressions || []) v = this.eval(e, env);
+          return v;
+        }
+        case "ArraySubscriptExpression":
+          return this.lvalue(n, env).value;
+        case "MemberExpression":
+          return this.lvalue(n, env).value;
+        case "CastExpression":
+          return convert(
+            this.eval(n.expression, env),
+            this.typeFromTypeName(n.targetType)
+          );
+        case "TypeUnaryExpression":
+          return this.sizeofType(this.typeFromTypeName(n.targetType));
+        case "CallExpression":
+          return this.evalCall(n, env);
+        case "BrowCJSExpression":
+          return this.evalJS(n, env);
+        case "CompoundLiteral": {
+          const t = this.typeFromTypeName(n.type);
+          const c = this.allocateObject(t);
+          this.initialize(c, n.initializer);
+          c.__aggregateCell = true;
+          c.__arrayCell = t.kind === "array";
+          return c.value;
+        }
+        default:
+          throw new Error(`unsupported expression '${n.type}'`);
+      }
+    }
+    typeFromTypeName(tn) {
+      return applyDeclarator(
+        baseType(tn?.specifiers || [], this),
+        tn?.declarator,
+        this
+      );
+    }
+    evalUnary(n, env) {
+      const op = n.operator;
+      if (op === "sizeof") {
+        return this.sizeofExpr(n.argument, env);
+      }
+      if (op === "&") {
+        if (
+          n.argument?.type === "Identifier" &&
+          this.functions.has(n.argument.name)
+        )
+          return this.functionValue(n.argument.name);
+        const c = this.lvalue(n.argument, env);
+        let t = c.type;
+        const ptrType = { kind: "pointer", to: t, size: 4, align: 4 };
+        if (c.meta?.externalPointer) return c.meta.externalPointer;
+        if (c.__container)
+          return new CRefPointer(
+            c.__container,
+            this.sizeofType(t),
+            c.__index,
+            t
+          );
+        return this.makePointer(c, t);
+      }
+      if (op === "*") {
+        return this.derefCell(this.eval(n.argument, env)).value;
+      }
+      if (op === "!") return truth(this.eval(n.argument, env)) ? 0 : 1;
+      if (op === "~") {
+        const t = promote(this.inferType(n.argument, env));
+        const v = convert(this.eval(n.argument, env), t);
+        return convert(~Number(v), t);
+      }
+      if (op === "+") return this.eval(n.argument, env);
+      if (op === "-") {
+        const v = this.eval(n.argument, env);
+        return typeof v === "bigint" ? -v : -Number(v);
+      }
+      if (op === "++" || op === "--") {
+        const c = this.lvalue(n.argument, env);
+        const old = c.value;
+        const t = c.type;
+        const nv = this.evalBinary(
+          {
+            operator: op === "++" ? "+" : "-",
+            left: { type: "NumericLiteral", value: "1" },
+            right: { type: "NumericLiteral", value: "1" },
+          },
+          env
+        );
+        c.value = convert(Number(old) + (op === "++" ? 1 : -1), t);
+        return n.prefix ? c.value : old;
+      }
+      throw new Error(`unsupported unary operator '${op}'`);
+    }
+    evalBinary(n, env) {
+      const op = n.operator;
+      if (op === "&&") {
+        const a = this.eval(n.left, env);
+        return truth(a) ? (truth(this.eval(n.right, env)) ? 1 : 0) : 0;
+      }
+      if (op === "||") {
+        const a = this.eval(n.left, env);
+        return truth(a) ? 1 : truth(this.eval(n.right, env)) ? 1 : 0;
+      }
+      const a = this.eval(n.left, env),
+        b = this.eval(n.right, env);
+      if (isPointerValue(a) || isPointerValue(b)) {
+        if (op === "+") {
+          if (isPointerValue(a)) return a.add(toSafeInt(b));
+          if (isPointerValue(b)) return b.add(toSafeInt(a));
+        }
+        if (op === "-") {
+          if (isPointerValue(a) && isPointerValue(b)) return a.difference(b);
+          if (isPointerValue(a)) return a.subtract(toSafeInt(b));
+        }
+        if (["==", "!="].includes(op))
+          return (a?.address || 0) === (b?.address || 0)
+            ? op === "=="
+              ? 1
+              : 0
+            : op === "=="
+            ? 0
+            : 1;
+        if (["<", ">", "<=", ">="].includes(op)) {
+          const x = a?.address || 0,
+            y = b?.address || 0;
+          return op === "<"
+            ? x < y
+            : op === ">"
+            ? x > y
+            : op === "<="
+            ? x <= y
+            : x >= y;
+        }
+      }
+      if (
+        op === "==" ||
+        op === "!=" ||
+        op === "<" ||
+        op === ">" ||
+        op === "<=" ||
+        op === ">="
+      ) {
+        const x = Number(a),
+          y = Number(b);
+        return op === "=="
+          ? x === y
+            ? 1
+            : 0
+          : op === "!="
+          ? x !== y
+            ? 1
+            : 0
+          : op === "<"
+          ? x < y
+            ? 1
+            : 0
+          : op === ">"
+          ? x > y
+            ? 1
+            : 0
+          : op === "<="
+          ? x <= y
+            ? 1
+            : 0
+          : x >= y
+          ? 1
+          : 0;
+      }
+      if (
+        op === "+" ||
+        op === "-" ||
+        op === "*" ||
+        op === "/" ||
+        op === "%" ||
+        op === "<<" ||
+        op === ">>" ||
+        op === "&" ||
+        op === "|" ||
+        op === "^"
+      ) {
+        const t = binaryType(
+          this.inferType(n.left, env),
+          this.inferType(n.right, env),
+          op
+        );
+        if (isFloat(t)) {
+          const x = Number(a),
+            y = Number(b);
+          return op === "+"
+            ? x + y
+            : op === "-"
+            ? x - y
+            : op === "*"
+            ? x * y
+            : op === "/"
+            ? x / y
+            : op === "% "
+            ? x % y
+            : 0;
+        }
+        let x = typeof a === "bigint" ? a : BigInt(Math.trunc(Number(a))),
+          y = typeof b === "bigint" ? b : BigInt(Math.trunc(Number(b)));
+        let z =
+          op === "+"
+            ? x + y
+            : op === "-"
+            ? x - y
+            : op === "*"
+            ? x * y
+            : op === "/"
+            ? y === 0n
+              ? (() => {
+                  throw new Error("division by zero");
+                })()
+              : x / y
+            : op === "%"
+            ? y === 0n
+              ? (() => {
+                  throw new Error("division by zero");
+                })()
+              : x % y
+            : op === "<<"
+            ? x << y
+            : op === ">>"
+            ? x >> y
+            : op === "&"
+            ? x & y
+            : op === "|"
+            ? x | y
+            : x ^ y;
+        return convert(z, t);
+      }
+      throw new Error(`unsupported binary operator '${op}'`);
+    }
+    evalAssignment(n, env) {
+      const c = this.lvalue(n.left, env);
+      if (c.const) throw new Error("assignment of read-only object");
+      const r = this.eval(n.right, env);
+      let v;
+      if (n.operator === "=") v = convert(r, c.type);
+      else {
+        const op = n.operator.slice(0, -1);
+        v = convert(
+          this.evalBinary(
+            {
+              operator: op,
+              left: { type: "NumericLiteral", value: String(c.value) },
+              right: { type: "NumericLiteral", value: String(r) },
+            },
+            env
+          ),
+          c.type
+        );
+      }
+      if (c.meta?.externalPointer) {
+        this.storePointer(c.meta.externalPointer, c.type, v);
+      }
+      c.value = v;
+      return v;
+    }
+    evalCall(n, env) {
+      const cal = this.eval(n.callee, env);
+      const args = (n.arguments || []).map((x) => this.eval(x, env));
+      if (cal && cal.__cfunction) return cal.call(args);
+      if (typeof cal === "function") return cal(...args);
+      throw new Error("called object is not a function");
+    }
+    functionValue(name) {
+      const self = this,
+        d = this.functions.get(name);
+      return {
+        __cfunction: true,
+        call(args) {
+          return self.callFunction(d, args, name);
+        },
+      };
+    }
+    callFunction(d, args, name) {
+      const env = new CEnv(this.global);
+      const fd = this.findFunctionDeclarator(d.declarator);
+      const params = fd?.parameters || [];
+      for (let i = 0; i < params.length; i++) {
+        const p = params[i],
+          pn = this.declaratorName(p.declarator);
+        if (!pn) continue;
+        let pt = applyDeclarator(
+          baseType(p.specifiers, this),
+          p.declarator,
+          this
+        );
+        if (pt.kind === "array")
+          pt = { kind: "pointer", to: pt.of, size: 4, align: 4 };
+        env.define(pn, new CCell(pt, convert(args[i], pt)));
+      }
+      try {
+        this.execStatement(d.body, env);
+      } catch (e) {
+        if (e instanceof CReturn)
+          return convert(e.value, baseType(d.specifiers, this));
+        throw e;
+      }
+      return 0;
+    }
+    findFunctionDeclarator(d) {
+      if (!d) return null;
+      if (d.type === "FunctionDeclarator") return d;
+      if (d.direct) return this.findFunctionDeclarator(d.direct);
+      if (d.declarator) return this.findFunctionDeclarator(d.declarator);
+      return null;
+    }
+    execCompound(node, env) {
+      const local = new CEnv(env);
+      const body = node.body || [];
+      const labels = new Map();
+      for (let i = 0; i < body.length; i++)
+        if (body[i]?.type === "LabeledStatement") labels.set(body[i].label, i);
+      let pc = 0;
+      while (pc < body.length) {
+        try {
+          this.execStatement(body[pc], local);
+          pc++;
+        } catch (e) {
+          if (e instanceof CGoto) {
+            if (labels.has(e.label)) {
+              pc = labels.get(e.label);
+              continue;
+            }
+            throw e;
+          }
+          throw e;
+        }
+      }
+    }
+    execStatement(n, env) {
+      if (!n) return;
+      switch (n.type) {
+        case "CompoundStatement":
+          return this.execCompound(n, env);
+        case "Declaration":
+          return this.execDeclaration(n, env);
+        case "ExpressionStatement":
+          this.eval(n.expression, env);
+          return;
+        case "ReturnStatement":
+          throw new CReturn(
+            n.expression ? this.eval(n.expression, env) : undefined
+          );
+        case "IfStatement":
+          if (truth(this.eval(n.condition, env)))
+            this.execStatement(n.thenBranch, env);
+          else this.execStatement(n.elseBranch, env);
+          return;
+        case "WhileStatement":
+          while (truth(this.eval(n.condition, env))) {
+            try {
+              this.execStatement(n.body, env);
+            } catch (e) {
+              if (e instanceof CContinue) continue;
+              if (e instanceof CBreak) break;
+              throw e;
+            }
+          }
+          return;
+        case "DoWhileStatement":
+          do {
+            try {
+              this.execStatement(n.body, env);
+            } catch (e) {
+              if (e instanceof CContinue) {
+              } else if (e instanceof CBreak) break;
+              else throw e;
+            }
+          } while (truth(this.eval(n.condition, env)));
+          return;
+        case "ForStatement": {
+          const e = new CEnv(env);
+          if (n.init) {
+            if (n.init.type === "Declaration") this.execDeclaration(n.init, e);
+            else this.eval(n.init, e);
+          }
+          while (!n.condition || truth(this.eval(n.condition, e))) {
+            try {
+              this.execStatement(n.body, e);
+            } catch (x) {
+              if (x instanceof CBreak) break;
+              if (!(x instanceof CContinue)) throw x;
+            }
+            if (n.iteration) this.eval(n.iteration, e);
+          }
+          return;
+        }
+        case "BreakStatement":
+          throw new CBreak();
+        case "ContinueStatement":
+          throw new CContinue();
+        case "GotoStatement":
+          throw new CGoto(n.label);
+        case "LabeledStatement":
+          try {
+            return this.execStatement(n.statement, env);
+          } catch (e) {
+            if (e instanceof CGoto && e.label === n.label)
+              return this.execStatement(n.statement, env);
+            throw e;
+          }
+        case "SwitchStatement":
+          return this.execSwitch(n, env);
+        case "CaseStatement":
+          return this.execStatement(n.statement, env);
+        case "DefaultStatement":
+          return this.execStatement(n.statement, env);
+        case "NullStatement":
+          return;
+        case "BrowCJSStatement":
+          this.evalJS(n, env);
+          return;
+        default:
+          throw new Error(`unsupported statement '${n.type}'`);
+      }
+    }
+    execSwitch(n, env) {
+      const v = this.eval(n.expression, env),
+        body = n.body?.body || [];
+      let start = -1,
+        def = -1;
+      for (let i = 0; i < body.length; i++) {
+        const s = body[i];
+        if (
+          s.type === "CaseStatement" &&
+          Number(this.eval(s.expression, env)) === Number(v) &&
+          start < 0
+        )
+          start = i;
+        if (s.type === "DefaultStatement") def = i;
+      }
+      if (start < 0) start = def;
+      if (start < 0) return;
+      for (let i = start; i < body.length; i++) {
+        try {
+          this.execStatement(body[i], env);
+        } catch (e) {
+          if (e instanceof CBreak) return;
+          if (
+            e instanceof CContinue ||
+            e instanceof CReturn ||
+            e instanceof CGoto
+          )
+            throw e;
+          throw e;
+        }
+      }
+    }
+    execDeclaration(n, env) {
+      const typedef = n.specifiers?.some(
+        (s) => s.type === "StorageClassSpecifier" && s.value === "typedef"
+      );
+      if (typedef) {
+        for (const x of n.declarators || []) {
+          const name = this.declaratorName(x.declarator);
+          if (name)
+            this.typedefs.set(
+              name,
+              applyDeclarator(baseType(n.specifiers, this), x.declarator, this)
+            );
+        }
+        return;
+      }
+      for (const x of n.declarators || []) {
+        const name = this.declaratorName(x.declarator);
+        if (!name) continue;
+        const t = applyDeclarator(
+          baseType(n.specifiers, this),
+          x.declarator,
+          this
+        );
+        const storage = n.specifiers?.find(
+          (s) => s.type === "StorageClassSpecifier"
+        )?.value;
+        let cell;
+        if (storage === "static") {
+          const k = (this.currentFunctionName || "<global>") + ":" + name;
+          if (!this.staticCells.has(k))
+            this.staticCells.set(
+              k,
+              this.allocateObject(t, undefined, { static: true })
+            );
+          cell = this.staticCells.get(k);
+        } else cell = this.allocateObject(t);
+        if (x.initializer) this.initialize(cell, x.initializer, env);
+        if (t.kind === "array") cell.__arrayCell = true;
+        if (isAgg(t)) cell.__aggregateCell = true;
+        env.define(name, cell);
+      }
+    }
+    inferType(n, env) {
+      if (!n) return C.int;
+      if (n.type === "Identifier") {
+        const c = env.lookup(n.name);
+        if (c) return c.type;
+        if (this.enums.has(n.name)) return C.int;
+        if (this.functions.has(n.name)) {
+          const d = this.functions.get(n.name);
+          return { kind: "function", returnType: baseType(d.specifiers, this) };
+        }
+      }
+      if (n.type === "NumericLiteral") return n.isFloat ? C.double : C.int;
+      if (n.type === "CharacterLiteral") return C.int;
+      if (n.type === "StringLiteral")
+        return { kind: "pointer", to: C.char, size: 4, align: 4 };
+      if (n.type === "ArraySubscriptExpression") {
+        const t = this.inferType(n.object, env);
+        return t?.kind === "array"
+          ? t.of
+          : t?.kind === "pointer"
+          ? t.to
+          : C.int;
+      }
+      if (n.type === "MemberExpression") {
+        let t = this.inferType(n.object, env);
+        if (n.throughPointer && t?.kind === "pointer") t = t.to;
+        return t?.fields?.get(n.member)?.type || C.int;
+      }
+      if (n.type === "UnaryExpression") {
+        if (n.operator === "&")
+          return {
+            kind: "pointer",
+            to: this.inferType(n.argument, env),
+            size: 4,
+            align: 4,
+          };
+        if (n.operator === "*") {
+          const t = this.inferType(n.argument, env);
+          return t?.to || C.int;
+        }
+        if (n.operator === "sizeof") return C.unsigned_int;
+        return promote(this.inferType(n.argument, env));
+      }
+      if (n.type === "BinaryExpression")
+        return binaryType(
+          this.inferType(n.left, env),
+          this.inferType(n.right, env),
+          n.operator
+        );
+      if (n.type === "AssignmentExpression") return this.inferType(n.left, env);
+      if (n.type === "CastExpression")
+        return this.typeFromTypeName(n.targetType);
+      if (n.type === "ConditionalExpression")
+        return binaryType(
+          this.inferType(n.thenExpression, env),
+          this.inferType(n.elseExpression, env),
+          "?:"
+        );
+      return C.int;
+    }
+    sizeofExpr(n, env) {
+      if (n.type === "ParenthesizedExpression")
+        return this.sizeofExpr(n.expression, env);
+      if (n.type === "Identifier") {
+        const c = env.lookup(n.name);
+        if (c) return this.sizeofType(c.type);
+      }
+      if (n.type === "StringLiteral")
+        return (n.parts || []).map(decodeCString).join("").length + 1;
+      return this.sizeofType(this.inferType(n, env));
+    }
+    evalJS(n, env) {
+      const args = (n.arguments || []).map((a) => this.eval(a, env));
+      if (!args.length) return undefined;
+      return global.BrowCRuntime.evaluateJS(args[0]);
+    }
+    run(options = {}) {
+      const argv = Array.isArray(options.argv) ? options.argv : [];
+      const main = this.functions.get("main");
+      if (!main) throw new Error("BrowC program has no main()");
+      const fd = this.findFunctionDeclarator(main.declarator);
+      const params = fd?.parameters || [];
+      let args = [];
+      if (params.length) {
+        const argc = argv.length;
+        const av = global.BrowCRuntime.malloc((argv.length + 1) * 4);
+        const strings = [];
+        for (let i = 0; i < argv.length; i++) {
+          const p = global.BrowCRuntime.strdup(argv[i]);
+          strings.push(p);
+          global.BrowCRuntime.store32(av.add(i * 4), p.address);
+        }
+        global.BrowCRuntime.store32(av.add(argv.length * 4), 0);
+        args = [argc, av];
+      }
+      try {
+        return this.callFunction(main, args, "main");
+      } catch (e) {
+        if (e instanceof CExit) return e.code;
+        throw e;
+      }
+    }
+  }
+  class CReturn extends Error {
+    constructor(value) {
+      super();
+      this.value = value;
+    }
+  }
+  class CBreak extends Error {}
+  class CContinue extends Error {}
+  class CGoto extends Error {
+    constructor(label) {
+      super();
+      this.label = label;
+    }
+  }
+  class CExit extends Error {
+    constructor(code) {
+      super();
+      this.code = code;
+    }
+  }
+  function isPointerValue(v) {
+    return !!v && v.__browc_pointer === true;
+  }
+  function parseCNumber(s) {
+    s = String(s).replace(/'/g, "");
+    const clean = s.replace(/([uUlLfF]+)$/, "");
+    if (
+      /^0[xX][0-9a-fA-F]+[pP][+-]?\d+/.test(clean) ||
+      /^0[xX][0-9a-fA-F]*\.[0-9a-fA-F]+[pP][+-]?\d+/.test(clean)
+    ) {
+      const m = clean.match(
+        /^0[xX]([0-9a-fA-F]*(?:\.[0-9a-fA-F]*)?)[pP]([+-]?\d+)$/
+      );
+      if (m) {
+        let [ip, fp = ""] = m[1].split(".");
+        let mant = BigInt("0x" + (ip || "0") + fp);
+        let e = Number(m[2]) - 4 * fp.length;
+        return Number(mant) * 2 ** e;
+      }
+    }
+    if (/^0[0-7]+$/.test(clean) && clean.length > 1)
+      return Number.parseInt(clean, 8);
+    if (/^0[xX][0-9a-fA-F]+$/.test(clean)) return Number.parseInt(clean, 16);
+    if (/^[0-9]+$/.test(clean)) return Number(clean);
+    return Number(clean);
+  }
+  function decodeCChar(raw) {
+    const s = decodeCString(String(raw));
+    if (s.length === 0) return 0;
+    if (s.length === 1) return s.charCodeAt(0);
+    let v = 0;
+    for (const c of s) v = (v << 8) | c.charCodeAt(0);
+    return v;
+  }
+  function decodeCString(raw) {
+    let s = String(raw);
+    if (s[0] === '"' || s[0] === "'") s = s.slice(1, -1);
+    return s
+      .replace(/\\x([0-9A-Fa-f]+)/g, (_, h) =>
+        String.fromCodePoint(parseInt(h, 16))
+      )
+      .replace(/\\([0-7]{1,3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)))
+      .replace(/\\u([0-9A-Fa-f]{4})/g, (_, h) =>
+        String.fromCodePoint(parseInt(h, 16))
+      )
+      .replace(/\\U([0-9A-Fa-f]{8})/g, (_, h) =>
+        String.fromCodePoint(parseInt(h, 16))
+      )
+      .replace(/\\a/g, "\x07")
+      .replace(/\\b/g, "\b")
+      .replace(/\\f/g, "\f")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t")
+      .replace(/\\v/g, "\v")
+      .replace(/\\\\/g, "\\")
+      .replace(/\\"/g, '"')
+      .replace(/\\'/g, "'")
+      .replace(/\\\?/g, "?");
+  }
+
+  /* Runtime hardening independent of the interpreter. */
+  if (global.BrowCPointer && !global.BrowCPointer.prototype.__c99StridePatch) {
+    const P = global.BrowCPointer.prototype;
+    P.add = function (amount) {
+      const stride =
+        this.pointee && this.pointee.__size
+          ? this.pointee.__size
+          : (this.pointee && this.pointee.size) || 1;
+      return new global.BrowCPointer(
+        this.runtime,
+        this.block,
+        this.offset + toSafeInt(amount) * stride,
+        this.pointee
+      );
+    };
+    P.difference = function (other) {
+      if (!global.browcIsPointer?.(other) && !(other && other.__browc_pointer))
+        throw new Error("pointer subtraction requires pointer");
+      if (this.block !== other.block)
+        throw new Error("pointers must point into the same array object");
+      const stride = (this.pointee && this.pointee.size) || 1;
+      if (this.offset % stride || other.offset % stride)
+        throw new Error("misaligned pointer subtraction");
+      return (this.offset - other.offset) / stride;
+    };
+    P.__c99StridePatch = true;
+  }
+
+  /* Exit must be non-local control flow, not a normal return. */
+  const oldExit = global.BrowCRuntime.exit.bind(global.BrowCRuntime);
+  global.BrowCRuntime.exit = function (code = 0) {
+    throw new CExit(toSafeInt(code));
+  };
+  global.BrowCRuntime.runMain = function (main, options = {}) {
+    if (typeof main !== "function") throw new Error("no main");
+    try {
+      return main(...(options.argv || []));
+    } catch (e) {
+      if (e instanceof CExit) {
+        this.exitCode = e.code;
+        return e.code;
+      }
+      throw e;
+    }
+  };
+
+  /* C byte-string and formatted-I/O corrections. */
+  rt.strlen = function (v) {
+    if (v && v.__browc_pointer) {
+      let i = 0;
+      while (v.add(i).readUint8() !== 0) i++;
+      return i;
+    }
+    return new TextEncoder().encode(this.toCString(v)).length;
+  };
+  rt.strncmp = function (a, b, n) {
+    const aa = bytesOf(a),
+      bb = bytesOf(b),
+      m = Math.max(0, toSafeInt(n));
+    for (let i = 0; i < m; i++) {
+      const x = aa[i] ?? 0,
+        y = bb[i] ?? 0;
+      if (x !== y) return x < y ? -1 : 1;
+      if (x === 0) break;
+    }
+    return 0;
+  };
+  rt.strcmp = function (a, b) {
+    return rt.strncmp(a, b, Math.max(bytesOf(a).length, bytesOf(b).length) + 1);
+  };
+  rt.strncpy = function (dst, src, n) {
+    dst = rt.memory.requirePointer(dst);
+    const b = bytesOf(src),
+      m = Math.max(0, toSafeInt(n));
+    dst.checkRange(m);
+    for (let i = 0; i < m; i++) dst.add(i).writeUint8(i < b.length ? b[i] : 0);
+    return dst;
+  };
+  rt.strncat = function (dst, src, n) {
+    dst = rt.memory.requirePointer(dst);
+    const base = dst.readCString(),
+      addBytes = bytesOf(src).slice(0, Math.max(0, toSafeInt(n)));
+    const old = new TextEncoder().encode(base);
+    dst.checkRange(old.length + addBytes.length + 1);
+    for (let i = 0; i < addBytes.length; i++)
+      dst.add(old.length + i).writeUint8(addBytes[i]);
+    dst.add(old.length + addBytes.length).writeUint8(0);
+    return dst;
+  };
+  rt.strstr = function (hay, needle) {
+    if (hay && hay.__browc_pointer) {
+      const h = hay.readCString(),
+        n = this.toCString(needle),
+        i = h.indexOf(n);
+      return i < 0
+        ? null
+        : hay.add(new TextEncoder().encode(h.slice(0, i)).length);
+    }
+    const h = this.toCString(hay),
+      n = this.toCString(needle),
+      i = h.indexOf(n);
+    return i < 0 ? null : h.slice(i);
+  };
+  rt.strrchr = function (v, ch) {
+    const target = toSafeInt(ch) & 255;
+    if (v && v.__browc_pointer) {
+      for (let i = 0; ; i++) {
+        const x = v.add(i).readUint8();
+        if (x === target) return v.add(i);
+        if (x === 0) return null;
+      }
+    }
+    const s = this.toCString(v),
+      c = String.fromCharCode(target),
+      i = s.lastIndexOf(c);
+    return i < 0 ? null : s.slice(i);
+  };
+  rt.strpbrk = function (v, a) {
+    const set = new Set(
+      [...this.toCString(a)].map((x) => x.charCodeAt(0) & 255)
+    );
+    if (v && v.__browc_pointer) {
+      for (let i = 0; ; i++) {
+        const x = v.add(i).readUint8();
+        if (set.has(x)) return v.add(i);
+        if (x === 0) return null;
+      }
+    }
+    const s = this.toCString(v);
+    for (let i = 0; i < s.length; i++)
+      if (set.has(s.charCodeAt(i) & 255)) return s.slice(i);
+    return null;
+  };
+  function bytesOf(v) {
+    if (v && v.__browc_pointer) {
+      const a = [];
+      for (let i = 0; ; i++) {
+        const x = v.add(i).readUint8();
+        if (x === 0) break;
+        a.push(x);
+      }
+      return Uint8Array.from(a);
+    }
+    return new TextEncoder().encode(rt.toCString(v));
+  }
+  rt.format = function (format, args) {
+    format = String(format);
+    let out = "",
+      ai = 0;
+    const re =
+      /%(%|[-+ #0]*\d*(?:\.\d+)?(?:hh|h|ll|l|j|z|t|L)?[diouxXfFeEgGaAcspn])/g;
+    let last = 0,
+      m;
+    while ((m = re.exec(format))) {
+      out += format.slice(last, m.index);
+      last = re.lastIndex;
+      const spec = m[1];
+      if (spec === "%") {
+        out += "%";
+        continue;
+      }
+      const conv = spec[spec.length - 1];
+      const arg = args[ai++];
+      const len =
+        spec.match(/(hh|ll|h|l|j|z|t|L)(?=[diouxXfFeEgGaAcspn]$)/)?.[1] || "";
+      if (conv === "n") {
+        if (arg && arg.__browc_pointer) {
+          const count = out.length;
+          if (len === "hh") rt.store8(arg, count);
+          else if (len === "h") rt.store16(arg, count);
+          else rt.store32(arg, count);
+        }
+        continue;
+      }
+      if (conv === "s") {
+        out += arg == null ? "(null)" : rt.toCString(arg);
+        continue;
+      }
+      if (conv === "c") {
+        out += String.fromCharCode(toSafeInt(arg) & 0xff);
+        continue;
+      }
+      if (conv === "p") {
+        out +=
+          arg && arg.__browc_pointer ? "0x" + arg.address.toString(16) : "0x0";
+        continue;
+      }
+      let precision = (spec.match(/\.(\d+)/) || [])[1];
+      precision = precision == null ? undefined : Number(precision);
+      let flags = spec.match(/^[-+ #0]*/)?.[0] || "",
+        width = Number((spec.match(/[0-9]+/) || [])[0] || 0),
+        v = arg;
+      if ("diouxX".includes(conv)) {
+        let n = typeof v === "bigint" ? v : BigInt(Math.trunc(Number(v) || 0));
+        if (conv === "d" || conv === "i") {
+          let signed =
+            len === "hh"
+              ? 8
+              : len === "h"
+              ? 16
+              : len === "l" || len === "ll" || len === "j" || len === "t"
+              ? 64
+              : 32;
+          let mod = 1n << BigInt(signed);
+          n = ((n % mod) + mod) % mod;
+          if (n >= 1n << BigInt(signed - 1)) n -= mod;
+          out += n.toString(10);
+        } else {
+          let bits =
+            len === "hh"
+              ? 8
+              : len === "h"
+              ? 16
+              : len === "l" ||
+                len === "ll" ||
+                len === "j" ||
+                len === "z" ||
+                len === "t"
+              ? 64
+              : 32;
+          n =
+            ((n % (1n << BigInt(bits))) + (1n << BigInt(bits))) %
+            (1n << BigInt(bits));
+          out += n.toString(
+            conv === "o" ? 8 : conv === "x" || conv === "X" ? 16 : 10
+          );
+          if (conv === "X")
+            out =
+              out.slice(0, -out.match(/[^0-9A-F]*$/)?.[0]?.length || 0) +
+              out.slice(-1);
+        }
+      } else if ("fFeEgGaA".includes(conv)) {
+        let num = Number(v);
+        if (conv === "f" || conv === "F") out += num.toFixed(precision ?? 6);
+        else if (conv === "e" || conv === "E")
+          out += num.toExponential(precision ?? 6);
+        else if (conv === "g" || conv === "G") {
+          let z = num.toPrecision(precision ?? 6);
+          if (z.includes("e") || z.includes("E")) {
+            z = z
+              .replace(/(\d+\.\d*?)(0+)([eE])/, "$1$3")
+              .replace(/\.([eE])/, "$1");
+          } else {
+            z = z.replace(/\.(\d*?)0+$/, ".$1").replace(/\.$/, "");
+          }
+          out += z;
+        } else if (conv === "a" || conv === "A") {
+          if (num === 0) out += "0x0p+0";
+          else {
+            const sign = num < 0 ? "-" : "";
+            num = Math.abs(num);
+            let e = Math.floor(Math.log2(num)),
+              mant = num / 2 ** e;
+            out +=
+              sign +
+              "0x" +
+              mant.toString(16) +
+              (conv === "A" ? "P" : "p") +
+              (e >= 0 ? "+" : "") +
+              e;
+          }
+        }
+      } else out += String(v);
+      if (width && out.length < m.index + width) {
+        const piece = out.slice(m.index);
+        out = out.slice(0, m.index) + piece.padStart(width, " ");
+      }
+    }
+    out += format.slice(last);
+    return out;
+  };
+  global.strrchr = rt.strrchr.bind(rt);
+  global.strpbrk = rt.strpbrk.bind(rt);
+
+  /* Make native implementations discoverable without relying on JS globals. */
+  if (!global.__BROWC_IMPL__) {
+    global.__BROWC_IMPL__ = Object.create(null);
+  }
+  if (typeof global.BrowCNativeFunctions === "object")
+    Object.assign(global.__BROWC_IMPL__, global.BrowCNativeFunctions);
+
+  global.BrowCC99Interpreter = BrowCC99Interpreter;
+  global.runBrowCSource = function (
+    cSource,
+    filename = "<script>",
+    options = {}
+  ) {
+    const pp = new global.BrowCPreprocessor({
+      standardLibrary: typeof HEADERS !== "undefined" ? HEADERS : {},
+      filename,
+    });
+    const pre = pp.preprocess(cSource, filename);
+    const code = typeof pre === "string" ? pre : pre.code;
+    const ast = global.parseBrowC(code, { filename });
+    const interp = new BrowCC99Interpreter(ast, options);
+    return interp.run({ argv: options.argv || [] });
+  };
+  global.__BROWC_C99_SEMANTIC_LAYER__ = {
+    version: "2.0.0",
+    mode: "C99-semantic-interpreter",
+  };
+})(typeof globalThis !== "undefined" ? globalThis : window);
