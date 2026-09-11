@@ -1,4 +1,8 @@
 /*
+Features:
+Supported src attribute
+*/
+/*
  * browc-preprocessor.js
  *
  * BrowC C99 Preprocessor
