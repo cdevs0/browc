@@ -36,23 +36,33 @@
  * If a real DOM (native browser, or something like jsdom) is already
  * present, none of this runs and that real DOM is used untouched.
  * ========================================================================== */
-async function resolveExternalCScripts() {
-  const scripts = document.querySelectorAll('script[type="text/x-c"][src]');
-
-  for (const script of scripts) {
-    const src = script.getAttribute("src");
-    try {
-      const response = await fetch(src);
-      if (!response.ok) {
-        throw new Error("File not found");
-      }
-      script.textContent = await response.text();
-    } catch (error) {
-      throw new Error("File not found");
+function myFetch(url) {
+  var xhr = new XMLHttpRequest();
+  xhr.open("GET", url, false);
+  try {
+    xhr.send();
+    if (xhr.status >= 200 && xhr.status < 300) {
+      return xhr.responseText;
     }
+    console.error("Request failed with status " + xhr.status);
+    return null;
+  } catch (error) {
+    console.error("Network error or request blocked:", error);
+    return null;
   }
 }
-
+function resolveExternalCScripts() {
+  const scripts = document.querySelectorAll('script[type="text/x-c"][src]');
+  for (const script of scripts) {
+    const src = script.getAttribute("src");
+    const response = myFetch(src);
+    if (response === null) {
+      throw new Error("File not found: " + src);
+    }
+    script.textContent = response;
+    script.removeAttribute("src");
+  }
+}
 resolveExternalCScripts();
 (function bootstrapBrowCEnvironment(root) {
   if (
